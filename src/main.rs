@@ -3,7 +3,7 @@ use aws::*;
 use chrono::DateTime;
 use chrono::Utc;
 use config::{Config, FileFormat};
-use fastly::http::{HeaderValue, Method, StatusCode};
+use fastly::http::{HeaderValue, Method, StatusCode, HeaderMap};
 use fastly::request::CacheOverride;
 use fastly::{Body, Error, Request, RequestExt, Response, ResponseExt};
 
@@ -33,31 +33,14 @@ fn main(mut req: Request<Body>) -> Result<impl ResponseExt, Error> {
 
     log::debug!("URI: {:?}", req.uri());
 
-    let right_now = Utc::now();
-    let url = format!("{}", req.uri().path());
-    let headers = req.headers_mut();
+    // JMR - Only do this for a GET and HEAD
+    // JMR - Deal with HEAD (e.g. warm nearline cache). We have to issue a GET to s3 but when
+    // we return to the client we don't send the body.
 
-    headers.insert(
-        "Host",
-        HeaderValue::from_static("fsly-nlc-sfc.s3.us-west-002.backblazeb2.com"),
-    );
-
-    let auth_header = aws_v4_auth("s3", S3_DOMAIN, "", "GET", url.as_str(), right_now);
-    headers.insert("Authorization", auth_header.parse()?);
-
-    let x_amz_date = right_now.format("%Y%m%dT%H%M%SZ").to_string();
-    headers.insert("x-amz-date", x_amz_date.parse()?);
-    headers.insert("x-amz-content-sha256", empty_payload_hash().parse()?);
-
-    /*
-
-
-    .header("Host", HeaderValue::from_static(S3_DOMAIN))
-        .header("Authorization", aws_v4_auth("s3", S3_DOMAIN, "", "PUT", upload_url, now))
-        .header("x-amz-date", x_amz_date)
-        .header("x-amz-content-sha256", unsigned_payload_hash())
-     */
+    let url = req.uri().path().to_string();
+    set_aws_headers(req.headers_mut(), url)?;
     let mut beresp = req.send(NEARLINE_BACKEND)?;
+    
     /*
         if beresp.status() == StatusCode::FORBIDDEN {
             let mut new_req = beresp.fastly_metadata().unwrap().sent_req().unwrap();
@@ -79,7 +62,22 @@ fn main(mut req: Request<Body>) -> Result<impl ResponseExt, Error> {
             }
         }
     */
+    // If this is a head I need to remove body
     Ok(beresp)
+    // JMR - Loose macro and select and log success/failure.
+    // Set timer for 20ish seconds and log it's taking a long time.
+}
+
+fn set_aws_headers(headers: &mut HeaderMap, url: String) -> Result<(), Error> {
+    headers.insert("Host", HeaderValue::from_static(S3_DOMAIN));
+    let right_now = Utc::now();
+    let auth_header = aws_v4_auth("s3", S3_DOMAIN, "", "GET", url.as_str(), right_now);
+    headers.insert("Authorization", auth_header.parse()?);
+
+    let x_amz_date = right_now.format("%Y%m%dT%H%M%SZ").to_string();
+    headers.insert("x-amz-date", x_amz_date.parse()?);
+    headers.insert("x-amz-content-sha256", empty_payload_hash().parse()?);
+    Ok(())
 }
 
 /// This function reads the fastly.toml file and gets the deployed version. This is only run at
