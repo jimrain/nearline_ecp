@@ -3,7 +3,7 @@ use aws::*;
 use chrono::DateTime;
 use chrono::Utc;
 use config::{Config, FileFormat};
-use fastly::http::{HeaderValue, Method, StatusCode, HeaderMap};
+use fastly::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use fastly::request::CacheOverride;
 use fastly::{Body, Error, Request, RequestExt, Response, ResponseExt};
 
@@ -38,45 +38,62 @@ fn main(mut req: Request<Body>) -> Result<impl ResponseExt, Error> {
     // we return to the client we don't send the body.
 
     let url = req.uri().path().to_string();
-    set_aws_headers(req.headers_mut(), url)?;
+    set_aws_headers(req.headers_mut(), url, Method::GET)?;
     let mut beresp = req.send(NEARLINE_BACKEND)?;
-    
-    /*
-        if beresp.status() == StatusCode::FORBIDDEN {
-            let mut new_req = beresp.fastly_metadata().unwrap().sent_req().unwrap();
-            beresp = Request::builder()
-                .method(new_req.method())
-                .uri(new_req.uri())
-                .body(())
-                .unwrap()
-                .send(CUSTOMER_ORIGIN)?;
+    log::debug!("Status from nearline: {:?}", beresp.status());
 
-            if beresp.status() == StatusCode::OK {
-                // let b = beresp.fastly_metadata().unwrap().sent_req().unwrap().uri().into_parts();
-                Request::builder()
-                    .method(Method::PUT)
-                    // .uri(new_req.uri())
-                    .body(())
-                    .unwrap()
-                    .send_async(NEARLINE_BACKEND)?;
-            }
+    if beresp.status() == StatusCode::FORBIDDEN || beresp.status() == StatusCode::NOT_FOUND {
+        let mut new_req = beresp.fastly_metadata().unwrap().sent_req().unwrap();
+        beresp = Request::builder()
+            .method(new_req.method())
+            .uri(new_req.uri())
+            .body(())
+            .unwrap()
+            .send(CUSTOMER_ORIGIN)?;
+
+        if beresp.status() == StatusCode::OK {
+            let uri = beresp.fastly_metadata().unwrap().sent_req().unwrap().uri();
+            let url = uri.path().to_string();
+            let (parts, body) = beresp.into_parts();
+
+            let mut put_req = Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .body(body)
+                .unwrap();
+
+            set_aws_headers(put_req.headers_mut(), url, Method::PUT)?;
+            let nlresp = put_req.send(NEARLINE_BACKEND)?;
+            log::debug!("Response from NL Put: {:?}", nlresp.status());
         }
-    */
+    }
+
     // If this is a head I need to remove body
     Ok(beresp)
     // JMR - Loose macro and select and log success/failure.
     // Set timer for 20ish seconds and log it's taking a long time.
 }
 
-fn set_aws_headers(headers: &mut HeaderMap, url: String) -> Result<(), Error> {
+fn set_aws_headers(headers: &mut HeaderMap, url: String, method: Method) -> Result<(), Error> {
     headers.insert("Host", HeaderValue::from_static(S3_DOMAIN));
     let right_now = Utc::now();
-    let auth_header = aws_v4_auth("s3", S3_DOMAIN, "", "GET", url.as_str(), right_now);
+    let auth_header = aws_v4_auth(
+        "s3",
+        S3_DOMAIN,
+        "",
+        method.as_str(),
+        url.as_str(),
+        right_now,
+    );
     headers.insert("Authorization", auth_header.parse()?);
 
     let x_amz_date = right_now.format("%Y%m%dT%H%M%SZ").to_string();
     headers.insert("x-amz-date", x_amz_date.parse()?);
-    headers.insert("x-amz-content-sha256", empty_payload_hash().parse()?);
+    if method == Method::GET {
+        headers.insert("x-amz-content-sha256", empty_payload_hash().parse()?);
+    } else if method == Method::PUT {
+        headers.insert("x-amz-content-sha256", unsigned_payload_hash().parse()?);
+    }
     Ok(())
 }
 
