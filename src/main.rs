@@ -4,7 +4,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use config::{Config, FileFormat};
 use fastly::http::{HeaderMap, HeaderValue, Method, StatusCode};
-use fastly::request::CacheOverride;
+use fastly::request::{CacheOverride, downstream_request};
 use fastly::{Body, Error, Request, RequestExt, Response, ResponseExt};
 
 /// The name of a backend server associated with this service.
@@ -26,17 +26,16 @@ const S3_DOMAIN: &str = "fsly-nlc-sfc.s3.us-west-002.backblazeb2.com";
 /// route based on the request properties (such as method or path), send the request to a backend,
 /// make completely new requests, and/or generate synthetic responses.
 ///
-/// If `main` returns an error, a 500 error response will be delivered to the client.
-#[fastly::main]
-fn main(mut req: Request<Body>) -> Result<impl ResponseExt, Error> {
+fn main() -> Result<(), Error> {
     logging_init();
 
-    log::debug!("URI: {:?}", req.uri());
+    // log::debug!("URI: {:?}", req.uri());
 
     // JMR - Only do this for a GET and HEAD
     // JMR - Deal with HEAD (e.g. warm nearline cache). We have to issue a GET to s3 but when
     // we return to the client we don't send the body.
 
+    let mut req = downstream_request();
     let url = req.uri().path().to_string();
     set_aws_headers(req.headers_mut(), url, Method::GET)?;
     let mut beresp = req.send(NEARLINE_BACKEND)?;
@@ -50,26 +49,44 @@ fn main(mut req: Request<Body>) -> Result<impl ResponseExt, Error> {
             .body(())
             .unwrap()
             .send(CUSTOMER_ORIGIN)?;
+        // We got a response from the origin so send it to the browser before we send it to
+        // nearline.
+
+        // beresp.send_downstream();
+
 
         if beresp.status() == StatusCode::OK {
-            let uri = beresp.fastly_metadata().unwrap().sent_req().unwrap().uri();
+            let uri = beresp.fastly_metadata().unwrap().sent_req().unwrap().uri().clone();
             let url = uri.path().to_string();
             let (parts, body) = beresp.into_parts();
+            let chunks = body.into_bytes();
 
-            let mut put_req = Request::builder()
+            let mut nearline_put_req = Request::builder()
                 .method(Method::PUT)
                 .uri(uri)
-                .body(body)
+                .body(Body::from(chunks.as_slice()))
                 .unwrap();
 
-            set_aws_headers(put_req.headers_mut(), url, Method::PUT)?;
-            let nlresp = put_req.send(NEARLINE_BACKEND)?;
+            set_aws_headers(nearline_put_req.headers_mut(), url, Method::PUT)?;
+            let nlresp = nearline_put_req.send(NEARLINE_BACKEND)?;
             log::debug!("Response from NL Put: {:?}", nlresp.status());
+
+            Response::builder()
+                .body(Body::from(chunks.as_slice()))?
+                .send_downstream();
+
+            // beresp.body_mut().write_bytes(&chunks);
+            // beresp.send_downstream();
         }
+
+
+    } else {
+        // We got the object from nearline so return it to the browser.
+        beresp.send_downstream();
     }
 
-    // If this is a head I need to remove body
-    Ok(beresp)
+    // JMR - If this is a head I need to remove body
+    Ok(())
     // JMR - Loose macro and select and log success/failure.
     // Set timer for 20ish seconds and log it's taking a long time.
 }
