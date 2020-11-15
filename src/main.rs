@@ -1,12 +1,10 @@
 mod aws;
 use aws::*;
-use chrono::DateTime;
 use chrono::Utc;
 use config::{Config, FileFormat};
 use fastly::http::{HeaderMap, HeaderValue, Method, StatusCode};
-use fastly::request::{downstream_request, CacheOverride};
+use fastly::request::downstream_request;
 use fastly::{Body, Error, Request, RequestExt, Response, ResponseExt};
-use std::io::Read;
 
 /// The name of a backend server associated with this service.
 ///
@@ -29,7 +27,7 @@ const S3_DOMAIN: &str = "fsly-nlc-sfc.s3.us-west-002.backblazeb2.com";
 ///
 fn main() -> Result<(), Error> {
     logging_init();
-    
+
 
     // JMR - Only do this for a GET and HEAD
     // JMR - Deal with HEAD (e.g. warm nearline cache). We have to issue a GET to s3 but when
@@ -42,19 +40,17 @@ fn main() -> Result<(), Error> {
     log::debug!("Status from nearline: {:?}", beresp.status());
 
     if beresp.status() == StatusCode::FORBIDDEN || beresp.status() == StatusCode::NOT_FOUND {
-        let mut new_req = beresp.fastly_metadata().unwrap().sent_req().unwrap();
+        // This was a nearline cache MISS so build and send the request to the customer origin.
+        let new_req = beresp.fastly_metadata().unwrap().sent_req().unwrap();
         beresp = Request::builder()
             .method(new_req.method())
             .uri(new_req.uri())
             .body(())
             .unwrap()
             .send(CUSTOMER_ORIGIN)?;
-        // We got a response from the origin so send it to the browser before we send it to
-        // nearline.
-
-        // beresp.send_downstream();
 
         if beresp.status() == StatusCode::OK {
+            // Get the uri out of the request we sent to the origin.
             let uri = beresp
                 .fastly_metadata()
                 .unwrap()
@@ -62,8 +58,8 @@ fn main() -> Result<(), Error> {
                 .unwrap()
                 .uri()
                 .clone();
-            let url = uri.path().to_string();
-            let s_uri = uri.to_string();
+            // Grab the path, we'll need it for the aws headers.
+            let url_path = uri.path().to_string();
             let (parts, body) = beresp.into_parts();
             let chunks = body.into_bytes();
             let default_header_value = &HeaderValue::from_str("0").unwrap();
@@ -76,11 +72,13 @@ fn main() -> Result<(), Error> {
                 .get("Content-Type")
                 .unwrap_or(default_header_value);
 
+            // Send a copy of the response down to the client.
             Response::builder()
                 .body(Body::from(chunks.as_slice()))?
                 .send_downstream();
 
-            log::debug!("URI: {:?} URL: {:?}", uri, url);
+            // Build a new PUT request and send it to the nearline cache.
+            log::debug!("URI: {:?} URL: {:?}", uri, url_path);
             let mut nearline_put_req = Request::builder()
                 .method(Method::PUT)
                 .uri(uri)
@@ -89,21 +87,22 @@ fn main() -> Result<(), Error> {
                 .body(Body::from(chunks.as_slice()))
                 .unwrap();
 
-            set_aws_headers(nearline_put_req.headers_mut(), url, Method::PUT)?;
-            let mut nlresp = nearline_put_req.send(NEARLINE_BACKEND)?;
+            set_aws_headers(nearline_put_req.headers_mut(), url_path, Method::PUT)?;
+            let nlresp = nearline_put_req.send(NEARLINE_BACKEND)?;
             let status = nlresp.status();
-            let (nparts, nbody) = nlresp.into_parts();
+            let (_nparts, nbody) = nlresp.into_parts();
             log::debug!(
                 "Response from NL Status: {:?}, Put: {}",
                 status,
                 nbody.into_string()
             );
-
-            // beresp.body_mut().write_bytes(&chunks);
-            // beresp.send_downstream();
+        } else {
+            // The customer origin returned an error (non 200 status) so return the error to the
+            // client
+            beresp.send_downstream();
         }
     } else {
-        // We got the object from nearline so return it to the browser.
+        // We got the object from nearline so return it to the client.
         beresp.send_downstream();
     }
 
