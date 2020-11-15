@@ -28,87 +28,88 @@ const S3_DOMAIN: &str = "fsly-nlc-sfc.s3.us-west-002.backblazeb2.com";
 fn main() -> Result<(), Error> {
     logging_init();
 
-
-    // JMR - Only do this for a GET and HEAD
-    // JMR - Deal with HEAD (e.g. warm nearline cache). We have to issue a GET to s3 but when
-    // we return to the client we don't send the body.
-
     let mut req = downstream_request();
-    let url = req.uri().path().to_string();
-    set_aws_headers(req.headers_mut(), url, Method::GET)?;
-    let mut beresp = req.send(NEARLINE_BACKEND)?;
-    log::debug!("Status from nearline: {:?}", beresp.status());
+    let original_method = req.method().clone();
+    if original_method == Method::GET || original_method == Method::HEAD {
+        let url = req.uri().path().to_string();
+        set_aws_headers(req.headers_mut(), url, Method::GET)?;
+        let mut beresp = req.send(NEARLINE_BACKEND)?;
+        log::debug!("Status from nearline: {:?}", beresp.status());
 
-    if beresp.status() == StatusCode::FORBIDDEN || beresp.status() == StatusCode::NOT_FOUND {
-        // This was a nearline cache MISS so build and send the request to the customer origin.
-        let new_req = beresp.fastly_metadata().unwrap().sent_req().unwrap();
-        beresp = Request::builder()
-            .method(new_req.method())
-            .uri(new_req.uri())
-            .body(())
-            .unwrap()
-            .send(CUSTOMER_ORIGIN)?;
-
-        if beresp.status() == StatusCode::OK {
-            // Get the uri out of the request we sent to the origin.
-            let uri = beresp
-                .fastly_metadata()
+        if beresp.status() == StatusCode::FORBIDDEN || beresp.status() == StatusCode::NOT_FOUND {
+            // This was a nearline cache MISS so build and send the request to the customer origin.
+            let new_req = beresp.fastly_metadata().unwrap().sent_req().unwrap();
+            beresp = Request::builder()
+                .method(new_req.method())
+                .uri(new_req.uri())
+                .body(())
                 .unwrap()
-                .sent_req()
-                .unwrap()
-                .uri()
-                .clone();
-            // Grab the path, we'll need it for the aws headers.
-            let url_path = uri.path().to_string();
-            let (parts, body) = beresp.into_parts();
-            let chunks = body.into_bytes();
-            let default_header_value = &HeaderValue::from_str("0").unwrap();
-            let content_length = parts
-                .headers
-                .get("Content-Length")
-                .unwrap_or(default_header_value);
-            let content_type = parts
-                .headers
-                .get("Content-Type")
-                .unwrap_or(default_header_value);
+                .send(CUSTOMER_ORIGIN)?;
 
-            // Send a copy of the response down to the client.
-            Response::builder()
-                .body(Body::from(chunks.as_slice()))?
-                .send_downstream();
+            if beresp.status() == StatusCode::OK {
+                // Get the uri out of the request we sent to the origin.
+                let uri = beresp
+                    .fastly_metadata()
+                    .unwrap()
+                    .sent_req()
+                    .unwrap()
+                    .uri()
+                    .clone();
+                // Grab the path, we'll need it for the aws headers.
+                let url_path = uri.path().to_string();
+                let (parts, body) = beresp.into_parts();
+                let chunks = body.into_bytes();
+                let default_header_value = &HeaderValue::from_str("0").unwrap();
+                let content_length = parts
+                    .headers
+                    .get("Content-Length")
+                    .unwrap_or(default_header_value);
+                let content_type = parts
+                    .headers
+                    .get("Content-Type")
+                    .unwrap_or(default_header_value);
 
-            // Build a new PUT request and send it to the nearline cache.
-            log::debug!("URI: {:?} URL: {:?}", uri, url_path);
-            let mut nearline_put_req = Request::builder()
-                .method(Method::PUT)
-                .uri(uri)
-                .header("Content-Length", content_length)
-                .header("Content-Type", content_type)
-                .body(Body::from(chunks.as_slice()))
-                .unwrap();
+                // Send a copy of the response down to the client. If this was a GET return the
+                // body otherwise it was a head so just leave the body empty.
+                let mut client_body = Body::new();
+                if original_method == Method::GET {
+                    client_body = Body::from(chunks.as_slice());
+                }
+                Response::builder().body(client_body)?.send_downstream();
 
-            set_aws_headers(nearline_put_req.headers_mut(), url_path, Method::PUT)?;
-            let nlresp = nearline_put_req.send(NEARLINE_BACKEND)?;
-            let status = nlresp.status();
-            let (_nparts, nbody) = nlresp.into_parts();
-            log::debug!(
-                "Response from NL Status: {:?}, Put: {}",
-                status,
-                nbody.into_string()
-            );
+                // Build a new PUT request and send it to the nearline cache.
+                log::debug!("URI: {:?} URL: {:?}", uri, url_path);
+                let mut nearline_put_req = Request::builder()
+                    .method(Method::PUT)
+                    .uri(uri)
+                    .header("Content-Length", content_length)
+                    .header("Content-Type", content_type)
+                    .body(Body::from(chunks.as_slice()))
+                    .unwrap();
+
+                set_aws_headers(nearline_put_req.headers_mut(), url_path, Method::PUT)?;
+                let nlresp = nearline_put_req.send(NEARLINE_BACKEND)?;
+                let status = nlresp.status();
+                let (_nparts, nbody) = nlresp.into_parts();
+                log::debug!(
+                    "Response from NL Status: {:?}, Put: {}",
+                    status,
+                    nbody.into_string()
+                );
+            } else {
+                // The customer origin returned an error (non 200 status) so return the error to the
+                // client
+                beresp.send_downstream();
+            }
         } else {
-            // The customer origin returned an error (non 200 status) so return the error to the
-            // client
+            // We got the object from nearline so return it to the client.
             beresp.send_downstream();
         }
     } else {
-        // We got the object from nearline so return it to the client.
-        beresp.send_downstream();
+        // This was not a get or head so just send to customer origin and return response.
+        req.send(CUSTOMER_ORIGIN)?.send_downstream();
     }
-
-    // JMR - If this is a head I need to remove body
     Ok(())
-    // JMR - Loose macro and select and log success/failure.
     // Set timer for 20ish seconds and log it's taking a long time.
 }
 
