@@ -6,29 +6,28 @@ use fastly::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use fastly::request::downstream_request;
 use fastly::{Body, Error, Request, RequestExt, Response, ResponseExt};
 
-/// The name of a backend server associated with this service.
-///
-/// This should be changed to match the name of your own backend. See the the `Hosts` section of
-/// the Fastly WASM service UI for more information.
+/// The customers origin backend as defined in Tango
 const CUSTOMER_ORIGIN: &str = "ShastaRain";
-
-/// The name of a second backend associated with this service.
+/// The nearline backend (e.g. wasabi, backblaze, etc) as defined in Tango.
 const NEARLINE_BACKEND: &str = "backend_nlc";
 
+/// Logging endpoint as defined in Tango.
 const LOGGING_ENDPOINT: &str = "nearline_syslog";
 
 const S3_DOMAIN: &str = "fsly-nlc-sfc.s3.us-west-002.backblazeb2.com";
-// const S3_DOMAIN: &str = "s3.us-west-002.backblazeb2.com";
-/// The entry point for your application.
+
+/// The entry point for the application.
 ///
-/// This function is triggered when your service receives a client request. It could be used to
-/// route based on the request properties (such as method or path), send the request to a backend,
-/// make completely new requests, and/or generate synthetic responses.
+/// This function is triggered when the service receives a client request. This does not use the
+/// main macro from the fastly crate because we want to do some processing after sending a
+/// response back to the client.
 ///
 fn main() -> Result<(), Error> {
     logging_init();
 
     let mut req = downstream_request();
+    // Save the method from the original request because we will need to to determine what should
+    // be sent back to the client.
     let original_method = req.method().clone();
     if original_method == Method::GET || original_method == Method::HEAD {
         let url = req.uri().path().to_string();
@@ -90,12 +89,7 @@ fn main() -> Result<(), Error> {
                 set_aws_headers(nearline_put_req.headers_mut(), url_path, Method::PUT)?;
                 let nlresp = nearline_put_req.send(NEARLINE_BACKEND)?;
                 let status = nlresp.status();
-                let (_nparts, nbody) = nlresp.into_parts();
-                log::debug!(
-                    "Response from NL Status: {:?}, Put: {}",
-                    status,
-                    nbody.into_string()
-                );
+                log::debug!("Response from NL Status: {:?}", status);
             } else {
                 // The customer origin returned an error (non 200 status) so return the error to the
                 // client
