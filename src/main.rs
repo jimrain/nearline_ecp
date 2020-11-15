@@ -4,8 +4,9 @@ use chrono::DateTime;
 use chrono::Utc;
 use config::{Config, FileFormat};
 use fastly::http::{HeaderMap, HeaderValue, Method, StatusCode};
-use fastly::request::{CacheOverride, downstream_request};
+use fastly::request::{downstream_request, CacheOverride};
 use fastly::{Body, Error, Request, RequestExt, Response, ResponseExt};
+use std::io::Read;
 
 /// The name of a backend server associated with this service.
 ///
@@ -19,7 +20,7 @@ const NEARLINE_BACKEND: &str = "backend_nlc";
 const LOGGING_ENDPOINT: &str = "nearline_syslog";
 
 const S3_DOMAIN: &str = "fsly-nlc-sfc.s3.us-west-002.backblazeb2.com";
-
+// const S3_DOMAIN: &str = "s3.us-west-002.backblazeb2.com";
 /// The entry point for your application.
 ///
 /// This function is triggered when your service receives a client request. It could be used to
@@ -28,8 +29,7 @@ const S3_DOMAIN: &str = "fsly-nlc-sfc.s3.us-west-002.backblazeb2.com";
 ///
 fn main() -> Result<(), Error> {
     logging_init();
-
-    // log::debug!("URI: {:?}", req.uri());
+    
 
     // JMR - Only do this for a GET and HEAD
     // JMR - Deal with HEAD (e.g. warm nearline cache). We have to issue a GET to s3 but when
@@ -54,32 +54,54 @@ fn main() -> Result<(), Error> {
 
         // beresp.send_downstream();
 
-
         if beresp.status() == StatusCode::OK {
-            let uri = beresp.fastly_metadata().unwrap().sent_req().unwrap().uri().clone();
+            let uri = beresp
+                .fastly_metadata()
+                .unwrap()
+                .sent_req()
+                .unwrap()
+                .uri()
+                .clone();
             let url = uri.path().to_string();
+            let s_uri = uri.to_string();
             let (parts, body) = beresp.into_parts();
             let chunks = body.into_bytes();
-
-            let mut nearline_put_req = Request::builder()
-                .method(Method::PUT)
-                .uri(uri)
-                .body(Body::from(chunks.as_slice()))
-                .unwrap();
-
-            set_aws_headers(nearline_put_req.headers_mut(), url, Method::PUT)?;
-            let nlresp = nearline_put_req.send(NEARLINE_BACKEND)?;
-            log::debug!("Response from NL Put: {:?}", nlresp.status());
+            let default_header_value = &HeaderValue::from_str("0").unwrap();
+            let content_length = parts
+                .headers
+                .get("Content-Length")
+                .unwrap_or(default_header_value);
+            let content_type = parts
+                .headers
+                .get("Content-Type")
+                .unwrap_or(default_header_value);
 
             Response::builder()
                 .body(Body::from(chunks.as_slice()))?
                 .send_downstream();
 
+            log::debug!("URI: {:?} URL: {:?}", uri, url);
+            let mut nearline_put_req = Request::builder()
+                .method(Method::PUT)
+                .uri(uri)
+                .header("Content-Length", content_length)
+                .header("Content-Type", content_type)
+                .body(Body::from(chunks.as_slice()))
+                .unwrap();
+
+            set_aws_headers(nearline_put_req.headers_mut(), url, Method::PUT)?;
+            let mut nlresp = nearline_put_req.send(NEARLINE_BACKEND)?;
+            let status = nlresp.status();
+            let (nparts, nbody) = nlresp.into_parts();
+            log::debug!(
+                "Response from NL Status: {:?}, Put: {}",
+                status,
+                nbody.into_string()
+            );
+
             // beresp.body_mut().write_bytes(&chunks);
             // beresp.send_downstream();
         }
-
-
     } else {
         // We got the object from nearline so return it to the browser.
         beresp.send_downstream();
