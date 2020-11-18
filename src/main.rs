@@ -25,7 +25,14 @@ const S3_DOMAIN: &str = "fsly-nlc-sfc.s3.us-west-002.backblazeb2.com";
 fn main() -> Result<(), Error> {
     logging_init();
 
+
     let mut req = downstream_request();
+    /*
+    if req.headers().get("fastly-debug").unwrap == "true" {
+        log::debug!("Fastly Debug On");
+    }
+    */
+
     // Save the method from the original request because we will need to to determine what should
     // be sent back to the client.
     let original_method = req.method().clone();
@@ -74,7 +81,10 @@ fn main() -> Result<(), Error> {
                 if original_method == Method::GET {
                     client_body = Body::from(chunks.as_slice());
                 }
-                Response::builder().body(client_body)?.send_downstream();
+                Response::builder()
+                    .body(client_body)?
+                    .headers(parts.headers())
+                    .send_downstream();
 
                 // Build a new PUT request and send it to the nearline cache.
                 log::debug!("URI: {:?} URL: {:?}", uri, url_path);
