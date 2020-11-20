@@ -4,7 +4,8 @@ use chrono::Utc;
 use config::{Config, FileFormat};
 use fastly::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use fastly::request::downstream_request;
-use fastly::{Body, Error, Request, RequestExt, Response, ResponseExt};
+use fastly::{downstream_client_ip_addr, Body, Error, Request, RequestExt, Response, ResponseExt};
+use serde::{Deserialize, Serialize};
 
 /// The customers origin backend as defined in Tango
 const CUSTOMER_ORIGIN: &str = "ShastaRain";
@@ -13,9 +14,36 @@ const NEARLINE_BACKEND: &str = "backend_nlc";
 
 /// Logging endpoint as defined in Tango.
 const LOGGING_ENDPOINT: &str = "nearline_syslog";
-
+const SUMO_LOGGING_ENDPOINT: &str = "sumo_log";
 const S3_DOMAIN: &str = "fsly-nlc-sfc.s3.us-west-002.backblazeb2.com";
 
+#[derive(Serialize, Deserialize, Debug)]
+struct SumoLogEntry {
+    service_id: String,
+    service_version: u32,
+    client_ip: String,
+    geo_city: String,
+    geo_country_code: String,
+    geo_continent_code: String,
+    geo_region: String,
+    request_user_agent: String,
+    request_range: String,
+    request_accept_content: String,
+    request_accept_language: String,
+    request_accept_encoding: String,
+    request_accept_charset: String,
+    request_connection: String,
+    request_dnt: String,
+    request_forwarded: String,
+    request_via: String,
+    request_cache_control: String,
+    request_x_requested_with: String,
+    request_x_forwarded_for: String,
+    request: String,
+    host: String,
+    origin_host: String,
+    url: String,
+}
 /// The entry point for the application.
 ///
 /// This function is triggered when the service receives a client request. This does not use the
@@ -23,10 +51,9 @@ const S3_DOMAIN: &str = "fsly-nlc-sfc.s3.us-west-002.backblazeb2.com";
 /// response back to the client.
 ///
 fn main() -> Result<(), Error> {
-    logging_init();
-
-
     let mut req = downstream_request();
+    logging_init(&req);
+
     /*
     if req.headers().get("fastly-debug").unwrap == "true" {
         log::debug!("Fastly Debug On");
@@ -83,7 +110,7 @@ fn main() -> Result<(), Error> {
                 }
                 Response::builder()
                     .body(client_body)?
-                    .headers(parts.headers())
+                    // .headers(parts.headers())
                     .send_downstream();
 
                 // Build a new PUT request and send it to the nearline cache.
@@ -143,7 +170,7 @@ fn set_aws_headers(headers: &mut HeaderMap, url: String, method: Method) -> Resu
 /// This function reads the fastly.toml file and gets the deployed version. This is only run at
 /// compile time. Since we bump the version number after building (during the deploy) we return
 /// the version incremented by one so the version returned will match the deployed version.
-fn get_version() -> i32 {
+fn get_version() -> u32 {
     Config::new()
         .merge(config::File::from_str(
             include_str!("../fastly.toml"), // assumes the existence of fastly.toml
@@ -152,20 +179,89 @@ fn get_version() -> i32 {
         .unwrap()
         .get_str("version")
         .unwrap()
-        .parse::<i32>()
+        .parse::<u32>()
         .unwrap_or(0)
         + 1
 }
 
+fn get_service_id() -> String {
+    Config::new()
+        .merge(config::File::from_str(
+            include_str!("../fastly.toml"), // assumes the existence of fastly.toml
+            FileFormat::Toml,
+        ))
+        .unwrap()
+        .get_str("service_id")
+        .unwrap()
+}
 // Boiler plate function that I will include in every app until we have something in place that
 // doe this.
-fn logging_init() {
+fn logging_init(req: &Request<Body>) {
     log_fastly::Logger::builder()
         .max_level(log::LevelFilter::Debug)
         .default_endpoint(LOGGING_ENDPOINT)
+        .endpoint(SUMO_LOGGING_ENDPOINT)
         .init();
 
     fastly::log::set_panic_endpoint(LOGGING_ENDPOINT).unwrap();
-
-    log::debug!("ECP Nearline Version:{}", get_version());
+    let headers = req.headers();
+    let version = get_version();
+    let client_ip = fastly::downstream_client_ip_addr().unwrap();
+    let geo = fastly::geo::geo_lookup(client_ip).unwrap();
+    log::debug!("ECP Nearline Version:{}", version);
+    let sumo_log_entry = SumoLogEntry {
+        service_version: version,
+        client_ip: client_ip.to_string(),
+        service_id: get_service_id(),
+        geo_city: geo.city().to_string(),
+        geo_country_code: geo.country_code().to_string(),
+        geo_continent_code: geo.continent().as_code().to_string(),
+        geo_region: geo.region().unwrap().to_string(),
+        request_user_agent: get_header_val_or_none(headers, "user-agent".to_string()),
+        request_range: get_header_val_or_none(headers, "range".to_string()),
+        request_accept_content: get_header_val_or_none(headers, "accept".to_string()),
+        request_accept_language: get_header_val_or_none(headers, "accept-language".to_string()),
+        request_accept_encoding: get_header_val_or_none(headers, "accept-encoding".to_string()),
+        request_accept_charset: get_header_val_or_none(headers, "accept-charset".to_string()),
+        request_connection: get_header_val_or_none(headers, "connection".to_string()),
+        request_dnt: get_header_val_or_none(headers, "dnt".to_string()),
+        request_forwarded: get_header_val_or_none(headers, "forwarded".to_string()),
+        request_via: get_header_val_or_none(headers, "via".to_string()),
+        request_cache_control: get_header_val_or_none(headers, "cache-control".to_string()),
+        request_x_requested_with: get_header_val_or_none(headers, "x-requested-with".to_string()),
+        request_x_forwarded_for: get_header_val_or_none(headers, "x-forwarded-for".to_string()),
+        host: get_header_val_or_none(headers, "fastly-orig-host".to_string()),
+        origin_host: get_header_val_or_none(headers, "host".to_string()),
+        url: req.uri().to_string(),
+        request: req.method().to_string(),
+    };
+    let le = serde_json::to_string(&sumo_log_entry);
+    log::warn!(target: SUMO_LOGGING_ENDPOINT, "{}", le.unwrap());
 }
+
+fn get_header_val_or_none(headers: &HeaderMap, key: String) -> String {
+    let default_header_value = &HeaderValue::from_str("0").unwrap();
+    headers
+        .get(key)
+        .unwrap_or(default_header_value)
+        .to_str()
+        .unwrap_or_default()
+        .to_string()
+}
+/*
+{
+  "time_start": "%{begin:%Y-%m-%dT%H:%M:%S%Z}t",
+
+  "status": "%{resp.status}V",
+  "content_type": "%{cstr_escape(resp.http.Content-Type)}V",
+  "response_age": "%{cstr_escape(resp.http.Age)}V",
+  "response_cache_control": "%{cstr_escape(resp.http.Cache-Control)}V",
+  "response_expires": "%{cstr_escape(resp.http.Expires)}V",
+  "response_last_modified": "%{cstr_escape(resp.http.Last-Modified)}V",
+  "geo_datacenter": "%{server.datacenter}V",
+  "req_header_size": "%{req.header_bytes_read}V",
+  "req_body_size": "%{req.body_bytes_read}V",
+  "resp_header_size": "%{resp.header_bytes_written}V",
+  "resp_body_size": "%{resp.body_bytes_written}V"
+}
+ */
