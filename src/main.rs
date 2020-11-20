@@ -19,6 +19,7 @@ const S3_DOMAIN: &str = "fsly-nlc-sfc.s3.us-west-002.backblazeb2.com";
 
 #[derive(Serialize, Deserialize, Debug)]
 struct SumoLogEntry {
+    time_start: String,
     service_id: String,
     service_version: u32,
     client_ip: String,
@@ -43,6 +44,21 @@ struct SumoLogEntry {
     host: String,
     origin_host: String,
     url: String,
+    // Response headers must be options because I can't populate them when I instantiate the
+    // struct.
+    status: Option<String>,
+    content_type: Option<String>,
+    response_age: Option<String>,
+    response_cache_control: Option<String>,
+    response_expires: Option<String>,
+    response_last_modified: Option<String>,
+    /* Are these really necasary or helpful?
+    geo_datacenter: Option<String>,
+    req_header_size: Option<String>,
+    req_body_size: Option<String>,
+    resp_header_size: Option<String>,
+    resp_body_size: Option<String>,
+     */
 }
 /// The entry point for the application.
 ///
@@ -52,13 +68,7 @@ struct SumoLogEntry {
 ///
 fn main() -> Result<(), Error> {
     let mut req = downstream_request();
-    logging_init(&req);
-
-    /*
-    if req.headers().get("fastly-debug").unwrap == "true" {
-        log::debug!("Fastly Debug On");
-    }
-    */
+    let mut sumo_log_entry = logging_init(&req);
 
     // Save the method from the original request because we will need to to determine what should
     // be sent back to the client.
@@ -130,16 +140,24 @@ fn main() -> Result<(), Error> {
             } else {
                 // The customer origin returned an error (non 200 status) so return the error to the
                 // client
+                set_response_headers(&beresp, &mut sumo_log_entry);
                 beresp.send_downstream();
             }
         } else {
             // We got the object from nearline so return it to the client.
+            set_response_headers(&beresp, &mut sumo_log_entry);
             beresp.send_downstream();
         }
     } else {
         // This was not a get or head so just send to customer origin and return response.
-        req.send(CUSTOMER_ORIGIN)?.send_downstream();
+        let beresp = req.send(CUSTOMER_ORIGIN)?;
+        set_response_headers(&beresp, &mut sumo_log_entry);
+        beresp.send_downstream();
     }
+
+    let le = serde_json::to_string(&sumo_log_entry);
+    log::info!(target: SUMO_LOGGING_ENDPOINT, "{}", le.unwrap());
+
     Ok(())
     // Set timer for 20ish seconds and log it's taking a long time.
 }
@@ -196,7 +214,15 @@ fn get_service_id() -> String {
 }
 // Boiler plate function that I will include in every app until we have something in place that
 // doe this.
-fn logging_init(req: &Request<Body>) {
+fn logging_init(req: &Request<Body>) -> SumoLogEntry {
+
+    let headers = req.headers();
+
+    if get_header_val_or_none(headers, "fastly-debug".to_string()) == "true" {
+        // TODO: turn off syslog endpoint if this is off.
+        log::debug!("Fastly Debug On");
+    }
+
     log_fastly::Logger::builder()
         .max_level(log::LevelFilter::Debug)
         .default_endpoint(LOGGING_ENDPOINT)
@@ -204,12 +230,14 @@ fn logging_init(req: &Request<Body>) {
         .init();
 
     fastly::log::set_panic_endpoint(LOGGING_ENDPOINT).unwrap();
-    let headers = req.headers();
+
     let version = get_version();
     let client_ip = fastly::downstream_client_ip_addr().unwrap();
     let geo = fastly::geo::geo_lookup(client_ip).unwrap();
     log::debug!("ECP Nearline Version:{}", version);
+
     let sumo_log_entry = SumoLogEntry {
+        time_start: Utc::now().format("%Y%m%dT%H%M%SZ").to_string(),
         service_version: version,
         client_ip: client_ip.to_string(),
         service_id: get_service_id(),
@@ -234,9 +262,25 @@ fn logging_init(req: &Request<Body>) {
         origin_host: get_header_val_or_none(headers, "host".to_string()),
         url: req.uri().to_string(),
         request: req.method().to_string(),
+        status: None,
+        content_type: None,
+        response_age: None,
+        response_cache_control: None,
+        response_expires: None,
+        response_last_modified: None,
     };
-    let le = serde_json::to_string(&sumo_log_entry);
-    log::warn!(target: SUMO_LOGGING_ENDPOINT, "{}", le.unwrap());
+    sumo_log_entry
+}
+
+fn set_response_headers(resp: &Response<Body>, sumo_log_entry: &mut SumoLogEntry) {
+    let headers = resp.headers();
+    sumo_log_entry.status = Some(resp.status().to_string());
+    sumo_log_entry.content_type = Some(get_header_val_or_none(headers, "content-type".to_string()));
+    sumo_log_entry.response_age = Some(get_header_val_or_none(headers, "age".to_string()));
+    sumo_log_entry.response_cache_control = Some(get_header_val_or_none(headers, "cache-control".to_string()));
+    sumo_log_entry.response_cache_control = Some(get_header_val_or_none(headers, "cache-control".to_string()));
+    sumo_log_entry.response_expires = Some(get_header_val_or_none(headers, "expires".to_string()));
+    sumo_log_entry.response_last_modified = Some(get_header_val_or_none(headers, "last-modified".to_string()));
 }
 
 fn get_header_val_or_none(headers: &HeaderMap, key: String) -> String {
@@ -250,14 +294,7 @@ fn get_header_val_or_none(headers: &HeaderMap, key: String) -> String {
 }
 /*
 {
-  "time_start": "%{begin:%Y-%m-%dT%H:%M:%S%Z}t",
 
-  "status": "%{resp.status}V",
-  "content_type": "%{cstr_escape(resp.http.Content-Type)}V",
-  "response_age": "%{cstr_escape(resp.http.Age)}V",
-  "response_cache_control": "%{cstr_escape(resp.http.Cache-Control)}V",
-  "response_expires": "%{cstr_escape(resp.http.Expires)}V",
-  "response_last_modified": "%{cstr_escape(resp.http.Last-Modified)}V",
   "geo_datacenter": "%{server.datacenter}V",
   "req_header_size": "%{req.header_bytes_read}V",
   "req_body_size": "%{req.body_bytes_read}V",
