@@ -1,11 +1,14 @@
 mod aws;
 use aws::*;
 use chrono::Utc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use config::{Config, FileFormat};
 use fastly::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use fastly::request::downstream_request;
 use fastly::{downstream_client_ip_addr, Body, Error, Request, RequestExt, Response, ResponseExt};
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
+use std::io::Read;
 
 /// The customers origin backend as defined in Tango
 const CUSTOMER_ORIGIN: &str = "ShastaRain";
@@ -19,7 +22,7 @@ const S3_DOMAIN: &str = "fsly-nlc-sfc.s3.us-west-002.backblazeb2.com";
 
 #[derive(Serialize, Deserialize, Debug)]
 struct SumoLogEntry {
-    time_start: String,
+    time_start: u64,
     service_id: String,
     service_version: u32,
     client_ip: String,
@@ -42,22 +45,23 @@ struct SumoLogEntry {
     request_x_forwarded_for: String,
     request: String,
     host: String,
-    origin_host: String,
     url: String,
+    longitude: f64,
+    latitude: f64,
     // Response headers must be options because I can't populate them when I instantiate the
     // struct.
-    status: Option<String>,
-    content_type: Option<String>,
-    response_age: Option<String>,
-    response_cache_control: Option<String>,
-    response_expires: Option<String>,
-    response_last_modified: Option<String>,
-    /* Are these really necasary or helpful?
-    geo_datacenter: Option<String>,
-    req_header_size: Option<String>,
-    req_body_size: Option<String>,
+    origin_host: String,
+    status: String,
+    content_type: String,
+    response_age: String,
+    response_cache_control: String,
+    response_expires: String,
+    response_last_modified: String,
+    x_cache: String,
+    response_content_length: String,
+    /*
+    req_header_size: Option<String>,,
     resp_header_size: Option<String>,
-    resp_body_size: Option<String>,
      */
 }
 /// The entry point for the application.
@@ -98,6 +102,9 @@ fn main() -> Result<(), Error> {
                     .unwrap()
                     .uri()
                     .clone();
+
+                set_sumo_log_entries(&beresp, &mut sumo_log_entry, false);
+                set_response_headers(beresp.headers_mut(), false);
                 // Grab the path, we'll need it for the aws headers.
                 let url_path = uri.path().to_string();
                 let (parts, body) = beresp.into_parts();
@@ -140,18 +147,22 @@ fn main() -> Result<(), Error> {
             } else {
                 // The customer origin returned an error (non 200 status) so return the error to the
                 // client
-                set_response_headers(&beresp, &mut sumo_log_entry);
+                set_sumo_log_entries(&beresp, &mut sumo_log_entry, false);
+                set_response_headers(beresp.headers_mut(), false);
                 beresp.send_downstream();
             }
         } else {
             // We got the object from nearline so return it to the client.
-            set_response_headers(&beresp, &mut sumo_log_entry);
+            sumo_log_entry.origin_host = format!("orig-{}", "orig_host");
+            set_sumo_log_entries(&beresp, &mut sumo_log_entry, true);
+            set_response_headers(beresp.headers_mut(), true);
             beresp.send_downstream();
         }
     } else {
         // This was not a get or head so just send to customer origin and return response.
-        let beresp = req.send(CUSTOMER_ORIGIN)?;
-        set_response_headers(&beresp, &mut sumo_log_entry);
+        let mut beresp = req.send(CUSTOMER_ORIGIN)?;
+        set_sumo_log_entries(&beresp, &mut sumo_log_entry, false);
+        set_response_headers(beresp.headers_mut(), false);
         beresp.send_downstream();
     }
 
@@ -237,7 +248,7 @@ fn logging_init(req: &Request<Body>) -> SumoLogEntry {
     log::debug!("ECP Nearline Version:{}", version);
 
     let sumo_log_entry = SumoLogEntry {
-        time_start: Utc::now().format("%Y%m%dT%H%M%SZ").to_string(),
+        time_start: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
         service_version: version,
         client_ip: client_ip.to_string(),
         service_id: get_service_id(),
@@ -258,29 +269,54 @@ fn logging_init(req: &Request<Body>) -> SumoLogEntry {
         request_cache_control: get_header_val_or_none(headers, "cache-control".to_string()),
         request_x_requested_with: get_header_val_or_none(headers, "x-requested-with".to_string()),
         request_x_forwarded_for: get_header_val_or_none(headers, "x-forwarded-for".to_string()),
-        host: get_header_val_or_none(headers, "fastly-orig-host".to_string()),
-        origin_host: get_header_val_or_none(headers, "host".to_string()),
-        url: req.uri().to_string(),
+        host: get_header_val_or_none(headers, "host".to_string()),
+        url: req.uri().path().to_string(),
         request: req.method().to_string(),
-        status: None,
-        content_type: None,
-        response_age: None,
-        response_cache_control: None,
-        response_expires: None,
-        response_last_modified: None,
+        longitude: geo.longitude(),
+        latitude: geo.latitude(),
+        // Set these to 0 for now and we will populate when we get a response.
+        origin_host: "0".to_string(),
+        status: "0".to_string(),
+        content_type: "0".to_string(),
+        response_age: "0".to_string(),
+        response_cache_control: "0".to_string(),
+        response_expires: "0".to_string(),
+        response_last_modified: "0".to_string(),
+        x_cache: "0".to_string(),
+        response_content_length: 0.to_string(),
     };
     sumo_log_entry
 }
 
-fn set_response_headers(resp: &Response<Body>, sumo_log_entry: &mut SumoLogEntry) {
+fn set_sumo_log_entries(resp: &Response<Body>, sumo_log_entry: &mut SumoLogEntry, is_nlc: bool) {
+    let orig_host = resp.fastly_metadata().unwrap().sent_req().unwrap().uri().host().unwrap().to_string();
+    if is_nlc {
+      sumo_log_entry.origin_host = format!("nlc-{}", orig_host);
+    } else {
+        sumo_log_entry.origin_host = format!("orig-{}", orig_host);
+    }
+
+    // resp.body().into_bytes().len();
     let headers = resp.headers();
-    sumo_log_entry.status = Some(resp.status().to_string());
-    sumo_log_entry.content_type = Some(get_header_val_or_none(headers, "content-type".to_string()));
-    sumo_log_entry.response_age = Some(get_header_val_or_none(headers, "age".to_string()));
-    sumo_log_entry.response_cache_control = Some(get_header_val_or_none(headers, "cache-control".to_string()));
-    sumo_log_entry.response_cache_control = Some(get_header_val_or_none(headers, "cache-control".to_string()));
-    sumo_log_entry.response_expires = Some(get_header_val_or_none(headers, "expires".to_string()));
-    sumo_log_entry.response_last_modified = Some(get_header_val_or_none(headers, "last-modified".to_string()));
+    sumo_log_entry.status = resp.status().to_string();
+    sumo_log_entry.content_type = get_header_val_or_none(headers, "content-type".to_string());
+    sumo_log_entry.response_age = get_header_val_or_none(headers, "age".to_string());
+    sumo_log_entry.response_cache_control = get_header_val_or_none(headers, "cache-control".to_string());
+    sumo_log_entry.response_cache_control = get_header_val_or_none(headers, "cache-control".to_string());
+    sumo_log_entry.response_expires = get_header_val_or_none(headers, "expires".to_string());
+    sumo_log_entry.response_last_modified = get_header_val_or_none(headers, "last-modified".to_string());
+    sumo_log_entry.x_cache = get_header_val_or_none(headers, "x-cache".to_string());
+    sumo_log_entry.response_content_length = get_header_val_or_none(headers, "content-length".to_string());
+
+
+}
+
+fn set_response_headers(headers: &mut HeaderMap, is_nlc_cache_hit: bool) {
+       if is_nlc_cache_hit {
+        headers.append("x-nlc-cache", HeaderValue::from_static("HIT"));
+    } else {
+        headers.append("x-nlc-cache", HeaderValue::from_static("MISS"));
+    }
 }
 
 fn get_header_val_or_none(headers: &HeaderMap, key: String) -> String {
@@ -295,7 +331,6 @@ fn get_header_val_or_none(headers: &HeaderMap, key: String) -> String {
 /*
 {
 
-  "geo_datacenter": "%{server.datacenter}V",
   "req_header_size": "%{req.header_bytes_read}V",
   "req_body_size": "%{req.body_bytes_read}V",
   "resp_header_size": "%{resp.header_bytes_written}V",
