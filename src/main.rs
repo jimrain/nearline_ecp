@@ -9,6 +9,7 @@ use fastly::{downstream_client_ip_addr, Body, Error, Request, RequestExt, Respon
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
 use std::io::Read;
+use serde_json::ser::State::Rest;
 
 /// The customers origin backend as defined in Tango
 const CUSTOMER_ORIGIN: &str = "ShastaRain";
@@ -109,13 +110,27 @@ fn main() -> Result<(), Error> {
                 let url_path = uri.path().to_string();
                 let (parts, body) = beresp.into_parts();
                 let chunks = body.into_bytes();
+
+
+                let mut headers = HeaderMap::new();
+                headers = parts.headers.to_owned();
+                // parts.headers().clone_into(&mut headers);
+
                 let default_header_value = &HeaderValue::from_str("0").unwrap();
+                /*
                 let content_length = parts
                     .headers
                     .get("Content-Length")
                     .unwrap_or(default_header_value);
                 let content_type = parts
                     .headers
+                    .get("Content-Type")
+                    .unwrap_or(default_header_value);
+                */
+                let content_length = headers
+                    .get("Content-Length")
+                    .unwrap_or(default_header_value);
+                let content_type = headers
                     .get("Content-Type")
                     .unwrap_or(default_header_value);
 
@@ -125,11 +140,16 @@ fn main() -> Result<(), Error> {
                 if original_method == Method::GET {
                     client_body = Body::from(chunks.as_slice());
                 }
+
+                let down_stream_resp = Response::from_parts(parts, client_body).send_downstream();
+
+                /*
                 Response::builder()
                     .body(client_body)?
-                    // .headers(parts.headers())
-                    .send_downstream();
 
+                    .headers(parts.headers())
+                    .send_downstream();
+                 */
                 // Build a new PUT request and send it to the nearline cache.
                 log::debug!("URI: {:?} URL: {:?}", uri, url_path);
                 let mut nearline_put_req = Request::builder()
@@ -307,8 +327,6 @@ fn set_sumo_log_entries(resp: &Response<Body>, sumo_log_entry: &mut SumoLogEntry
     sumo_log_entry.response_last_modified = get_header_val_or_none(headers, "last-modified".to_string());
     sumo_log_entry.x_cache = get_header_val_or_none(headers, "x-cache".to_string());
     sumo_log_entry.response_content_length = get_header_val_or_none(headers, "content-length".to_string());
-
-
 }
 
 fn set_response_headers(headers: &mut HeaderMap, is_nlc_cache_hit: bool) {
@@ -328,12 +346,4 @@ fn get_header_val_or_none(headers: &HeaderMap, key: String) -> String {
         .unwrap_or_default()
         .to_string()
 }
-/*
-{
 
-  "req_header_size": "%{req.header_bytes_read}V",
-  "req_body_size": "%{req.body_bytes_read}V",
-  "resp_header_size": "%{resp.header_bytes_written}V",
-  "resp_body_size": "%{resp.body_bytes_written}V"
-}
- */
