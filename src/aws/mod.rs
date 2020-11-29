@@ -44,7 +44,7 @@ pub fn aws_v4_auth(
     now: DateTime<Utc>,
 ) -> String {
     let amz_content_256 = match method {
-        "GET" | "HEAD" => hash(payload.to_string()),
+        "GET" | "HEAD" | "DELETE" => hash(payload.to_string()),
         _ => unsigned_payload_hash(),
     };
 

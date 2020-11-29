@@ -1,4 +1,4 @@
-version = 63
+version = 65
 name = "nearline-ecp"
 description = "demo"
 authors = ["jrainville+ecp@fastly.com"]

@@ -117,16 +117,7 @@ fn main() -> Result<(), Error> {
                 // parts.headers().clone_into(&mut headers);
 
                 let default_header_value = &HeaderValue::from_str("0").unwrap();
-                /*
-                let content_length = parts
-                    .headers
-                    .get("Content-Length")
-                    .unwrap_or(default_header_value);
-                let content_type = parts
-                    .headers
-                    .get("Content-Type")
-                    .unwrap_or(default_header_value);
-                */
+
                 let content_length = headers
                     .get("Content-Length")
                     .unwrap_or(default_header_value);
@@ -143,13 +134,6 @@ fn main() -> Result<(), Error> {
 
                 let down_stream_resp = Response::from_parts(parts, client_body).send_downstream();
 
-                /*
-                Response::builder()
-                    .body(client_body)?
-
-                    .headers(parts.headers())
-                    .send_downstream();
-                 */
                 // Build a new PUT request and send it to the nearline cache.
                 log::debug!("URI: {:?} URL: {:?}", uri, url_path);
                 let mut nearline_put_req = Request::builder()
@@ -178,6 +162,11 @@ fn main() -> Result<(), Error> {
             set_response_headers(beresp.headers_mut(), true);
             beresp.send_downstream();
         }
+    } else if original_method == Method::DELETE {
+        let url = req.uri().path().to_string();
+        set_aws_headers(req.headers_mut(), url, Method::DELETE)?;
+        let mut beresp = req.send(NEARLINE_BACKEND)?;
+        log::debug!("Status from nearline: {:?}", beresp.status());
     } else {
         // This was not a get or head so just send to customer origin and return response.
         let mut beresp = req.send(CUSTOMER_ORIGIN)?;
@@ -208,7 +197,7 @@ fn set_aws_headers(headers: &mut HeaderMap, url: String, method: Method) -> Resu
 
     let x_amz_date = right_now.format("%Y%m%dT%H%M%SZ").to_string();
     headers.insert("x-amz-date", x_amz_date.parse()?);
-    if method == Method::GET {
+    if method == Method::GET || method == Method::DELETE {
         headers.insert("x-amz-content-sha256", empty_payload_hash().parse()?);
     } else if method == Method::PUT {
         headers.insert("x-amz-content-sha256", unsigned_payload_hash().parse()?);
