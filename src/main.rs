@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
 use std::io::Read;
 use serde_json::ser::State::Rest;
+use std::str::FromStr;
 
 /// The customers origin backend as defined in Tango
 const CUSTOMER_ORIGIN: &str = "ShastaRain";
@@ -78,7 +79,7 @@ fn main() -> Result<(), Error> {
     // Save the method from the original request because we will need to to determine what should
     // be sent back to the client.
     let original_method = req.method().clone();
-    if original_method == Method::GET || original_method == Method::HEAD {
+    if original_method == Method::GET || original_method == Method::HEAD || original_method == Method::from_str("PURGE").unwrap() {
         let url = req.uri().path().to_string();
         set_aws_headers(req.headers_mut(), url, Method::GET)?;
         let mut beresp = req.send(NEARLINE_BACKEND)?;
@@ -167,6 +168,7 @@ fn main() -> Result<(), Error> {
         set_aws_headers(req.headers_mut(), url, Method::DELETE)?;
         let mut beresp = req.send(NEARLINE_BACKEND)?;
         log::debug!("Status from nearline: {:?}", beresp.status());
+        beresp.send_downstream();
     } else {
         // This was not a get or head so just send to customer origin and return response.
         let mut beresp = req.send(CUSTOMER_ORIGIN)?;
